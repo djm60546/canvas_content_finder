@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Find Canvas Content
 // @namespace    https://github.com/djm60546/pages-text-content-locater
-// @version      1.0
-// @description  Script for finding code or text in multiple Canvas courses using the Canvas API. Generates a .CSV download containing the find results.
+// @version      2.0
+// @description  Script for finding code or text strings in multiple Canvas courses using the Canvas API. Generates a .CSV download containing the find results.
 // @author       Dan Murphy, Northwestern University School of Professional Studies (dmurphy@northwestern.edu)
 // @match        https://canvas.northwestern.edu/accounts/*
-// @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/1.3.3/FileSaver.js
-// @require      https://code.jquery.com/jquery-3.4.1.js
-// @require      https://code.jquery.com/ui/1.12.1/jquery-ui.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
+// @require      https://code.jquery.com/jquery-3.7.1.min.js
+// @require      https://code.jquery.com/ui/1.14.2/jquery-ui.min.js
 // @grant        none
 
 // ==/UserScript==
@@ -22,8 +22,8 @@
 
     var pagesData = [];
     var coursesData = {};
-    var currCourse = {};
-    var ajaxPool;
+    var ajaxPool = [];
+    var currentRunId = 0;
     var controls = {};
     controls.aborted = false;
     controls.canvasAcct = "21"; // SPS Canvas sub-account number
@@ -35,444 +35,1111 @@
     controls.matchString;
     controls.matchRegex;
     controls.matchNoCase = false;
-    controls.multiLine = false;
+    controls.useRegex = false;
+    controls.rsrcTypeAssgnmnts = true;
+    controls.rsrcTypeDscssns = true;
+    controls.rsrcTypePages = true;
+    controls.rsrcTypeQuizzes = true;
     controls.rsrcTypeIdx;
     controls.contentKeyArray = ['description','message','body','description']
+    controls.contentLabelArray = ['assignments','discussions','pages','quizzes']
 
-    function errorHandler(e) {
-        console.log(e.name + ': ' + e.message + 'at ' + e.stack);
-        alert('An error occured. See browser console for details.');
-        abortAll();
+    // Concurrency and retry configuration
+    controls.initialConcurrency = 4;
+    controls.minimumConcurrency = 1;
+    controls.maximumConcurrency = 4;
+    controls.courseConcurrency = 2;
+
+    controls.maximumAttempts = 6;
+    controls.baseRetryDelay = 1000;
+    controls.maximumRetryDelay = 30000;
+
+    // Add a short pause when the Canvas quota becomes low.
+    controls.lowQuotaThreshold = 25;
+    controls.lowQuotaDelay = 500;
+
+    // Restore concurrency gradually after successful requests.
+    controls.successesBeforeIncrease = 20;
+
+    function errorHandler(error) {
+        if (isAbortError(error)) {
+            console.info('Canvas content search canceled.');
+            return;
+        }
+
+        console.error(
+            error.name + ': ' +
+            error.message,
+            error.stack || error
+        );
+
+        alert(
+            'The Canvas content search could not be completed. ' +
+            'See the browser console for details.'
+        );
+
+        if (!controls.aborted) {
+            abortAll();
+        }
     }
 
     function abortAll() {
-        for (var i = 0; i < ajaxPool.length; i++) {
-            ajaxPool[i].abort();
+        if (controls.aborted) {
+            return;
         }
-        ajaxPool = [];
-        wrapup();
+
+        controls.aborted = true;
+        currentRunId++;
+
+        requestScheduler.cancel();
+
+        var pendingRequests = ajaxPool.slice();
+        ajaxPool.length = 0;
+
+        pendingRequests.forEach(function(request) {
+            try {
+                request.abort();
+            } catch (error) {
+                console.warn('Unable to abort request.', error);
+            }
+        });
+
+        wrapup(true);
     }
 
-    function nextURL(linkTxt) {
-        var url = null;
-        if (linkTxt) {
-            var links = linkTxt.split(',');
-            var nextRegEx = new RegExp('^<(.*)>; rel="next"$');
+    // For API calls that return more than one page of results, get the URL of the next page
+    function nextURL(linkHeader) {
+        if (!linkHeader) {
+            return null;
+            }
+
+            var links = linkHeader.split(',');
+
             for (var i = 0; i < links.length; i++) {
-                var matches = nextRegEx.exec(links[i]);
-                if (matches) {
-                    url = matches[1];
+                var match = links[i].match(/<([^>]+)>\s\srel="next"/);
+
+                if (match) {
+                    return match[1];
                 }
             }
-        }
-        return url;
-    }
 
-    function setupPool() {
-        // console.log('setupPool');
-        try {
-            ajaxPool = [];
-            $.ajaxSetup({
-                'beforeSend' : function(jqXHR) {
-                    ajaxPool.push(jqXHR);
-                },
-                'complete' : function(jqXHR) {
-                    var i = ajaxPool.indexOf(jqXHR);
-                    if (i > -1) {
-                        ajaxPool.splice(i, 1);
-                    }
-                }
-            });
-        } catch (e) {
-            throw new Error('Error configuring AJAX pool');
+            return null;
         }
-    }
 
-    //Create RegEx string, escape reserved characters, set flags based on user input
+    // Create RegEx string for the search term, escape reserved characters, set RegEx flags based on user input
     function prepRegex() {
-        const cleanRegex = RegExp(/.\+*?[^]$(){}=!<>|:-/,'g');
-        var cleanMatchStr = controls.matchString.replace(cleanRegex);
-        cleanMatchStr += '+';
-        var regExFlags = 'g';
-        if (controls.matchNoCase == true) {regExFlags += 'i'}
-        if (controls.multiLine == true) {regExFlags += 'm'}
-        controls.matchRegex = RegExp(cleanMatchStr, regExFlags);
-    }
 
-    function callbackController() {
-        controls.rsrcTypeIdx++;
-        var lURL = '/api/v1/courses/' + currCourse.id;
-        switch(controls.rsrcTypeIdx) {
-            case 0:
-                lURL += '/assignments?per_page=100';
-                getResourcesList(lURL,'id');
-                break
-            case 1:
-                lURL += '/discussion_topics?per_page=100';
-                getResourcesList(lURL,'id')
-                break;
-            case 2:
-                lURL += '/pages?per_page=100';
-                getResourcesList(lURL,'page_id')
-                break;
-            case 3:
-                lURL += '/quizzes?per_page=100';
-                getResourcesList(lURL,'id')
-                break;
-            case 4:
-                controls.coursePending--;
-                makeNewReport();
+        var flags = 'g';
+
+        if (controls.matchNoCase) {
+            flags += 'i';
         }
-    }
 
-    //Run RegEx Match on the body attribute of each Canvas page in the selected course
-    function parsePage(pURL) {
-        const pathRregex = /\/api\/v1/;
-        var linkURL = pURL.replace(pathRregex,'https:\/\/canvas.northwestern.edu');
         try {
-            $.getJSON(pURL, function(pdata, status, jqXHR) { // Get users for the current course
-                var thisPage = pdata;
-                var contentAttr = controls.contentKeyArray[controls.rsrcTypeIdx];
-                var str = thisPage[contentAttr];
-                if (str && str != null) {
-                    var match = str.match(controls.matchRegex);
-                    var matchLen = match != null ? match.length : 0;
-                    if (matchLen > 0) {
-                        thisPage.url = linkURL;
-                        thisPage.course_id = currCourse.id;
-                        thisPage.matches = matchLen;
-                        pagesData.push(thisPage);
-                    }
-                }
-            }).fail(function() {
-                var errorDetail = 'parsePage: ' + pURL;
-                throw new Error(errorDetail);
-            }).done(function () {
-                checkPages();
-            });
-        } catch (e) {
-            errorHandler(e);
-        }
-    }
 
-    //Callback function to do an API call on each page in the course. Continue to next course or report output when all pages have been checked.
-    function checkPages() {
-        $('#ccf_report_status').text('Checking resources...');
-        if (controls.pageIndex == controls.pagesArray.length) {
-            callbackController();
-        } else {
-            progressbar(controls.pageIndex, controls.pagesArray.length);
-            var rURL = controls.pagesArray[controls.pageIndex];
-            parsePage(rURL);
-            controls.pageIndex++;
-        }
-    }
+            if (controls.useRegex) {
 
-    // Get the list of pages for the current course
-    function getResourcesList(lURL,rsrcTypeID) {
-        const regex = /\?per_page=100/;
-        var urlStem = lURL.replace(regex,'');
-        // console.log('getResourcesList');
-        $('#ccf_report_status').text('Getting resources list...');
-        if (controls.aborted) {
-            console.log('Aborted at getResourcesList()');
-            return false;
-        }
-        try {
-            $.getJSON(lURL, function(ldata, status, jqXHR) { // Get users for the current course
-                lURL = nextURL(jqXHR.getResponseHeader('Link')); // Get next page of results, if any
-                for (var i = 0; i < ldata.length; i++) {
-                    if (controls.rsrcTypeIdx == 1) { // Skip graded discussion topics to prevent the same resource included as an assigment and discussion
-                        if (typeof ldata[i].assignment !== 'undefined' || ldata[i].assignment != null) {continue}
-                    }
-                    progressbar(i, ldata.length);
-                    var rsrcID = ldata[i][rsrcTypeID];
-                    var rURL = urlStem + '/' + rsrcID;
-                    controls.pagesArray.push(rURL);
-                }
-            }).fail(function() {
-                var errorDetail = 'Error getting ' + rsrcID + ' in ' + currCourse.course_id;
-                throw new Error(errorDetail);
-            }).done(function () {
-                if (lURL) {
-                    getResourcesList(lURL);
-                } else {
-                    if (controls.pagesArray.length === 0) {
-                        callbackController();
-                    }
-                    else {
-                        checkPages();
-                    }
-                }
-            });
-        } catch (e) {
-            errorHandler(e);
-        }
-    }
+                // User supplied actual regex
+                controls.matchRegex = new RegExp(controls.matchString,flags);
 
-    // Get course data one time to be applied to all pages of the current course
-    function getCourseData(crsID) {
-        //console.log('getCourseData');
-        $('#ccf_report_status').text('Getting course data...');
-        if (controls.aborted) {
-            console.log('Aborted at getCourseData()');
-            return false;
-        }
-        try {
-            $('#ccf_report_status').text('Getting course data...');
-            var urlCrs = '/api/v1/courses/' + crsID;
-            $.getJSON(urlCrs, function(cdata, status, jqXHR) {
-                if (cdata) {
-                    var thisCourse = {};
-                    thisCourse.id = cdata.id;
-                    thisCourse.course_code = cdata.course_code;
-                    thisCourse.name = cdata.name;
-                    thisCourse.term = cdata.enrollment_term_id
-                    coursesData[thisCourse.id] = thisCourse;
-                    currCourse = cdata;
-                    $('#ccf_report_name').text(cdata.course_code);
-                }
-            }).fail(function() {
-                var errorDetail = 'course,' + currCourse.id;
-                throw new Error(errorDetail);
-            }).done(function () {
-                callbackController();
-            });
-        } catch (e) {
-            errorHandler(e);
-        }
-    }
-
-    // Begin gathering data for the first/next course. Clear objects, vars and arrays that contain data from the previous course
-    function makeNewReport() {
-        // console.log('makeNewReport');
-        try {
-            Object.keys(currCourse).forEach(function(key) { delete currCourse[key]; });
-            controls.pagesArray = [];
-            controls.pageIndex = 0;
-            controls.rsrcTypeIdx = -1;
-            if (controls.coursePending === 0) { // Output report if no more reports are pending
-                outputReport();
             } else {
-                controls.aborted = false;
-                controls.courseIndex = controls.courseArray.length - controls.coursePending;
-                var currCourseID = controls.courseArray[controls.courseIndex];
-                progressbar(0,0); // Reset progress bar
-                getCourseData(currCourseID);
+
+                // Literal text search
+                var escaped = String(controls.matchString).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+
+                controls.matchRegex = new RegExp(escaped,flags);
             }
-        } catch (e) {
-            errorHandler(e);
+
+        } catch (error) {
+
+            throw new Error(
+                'Invalid regular expression: ' + error.message);
         }
     }
 
-    // Get the Canvas course IDs that match the user's search criteria
-    function getCourseIds(crsURL) {
-        try {
-            $.getJSON(crsURL, function(cdata, status, jqXHR) {
-                crsURL = nextURL(jqXHR.getResponseHeader('Link'));
-                if (cdata) {
-                    for (var i = 0; i < cdata.length; i++) {
-                        var thisCourse = cdata[i];
-                        var goodURL = true;
-                        var crsNameStr = thisCourse.course_code;
-                        var dlPttrn = /-DL_/;
-                        var dlStatus = dlPttrn.test(crsNameStr); // Check if a course is online by the -DL_ pattern in link text
-                        if ((controls.dlCrsOnly && dlStatus) || !controls.dlCrsOnly) { // Add courses to the list; either online only or all
-                            var cncldPttrn = /_SECX\d\d/;
-                            var cncldStatus = cncldPttrn.test(crsNameStr); // Check if current course is cancelled with "_SECX[two digits]" in the course name
-                            if (cncldStatus) {continue} // Do not include cancelled courses
-                            controls.courseArray.push(thisCourse.id);
-                            if (cncldStatus) {
-                                console.log(thisCourse.name + ' - Cancelled');
-                                controls.emptyCourse = true;
-                            }
-                        }
-                    }
-                }
-            }).done(function () {
-                if (crsURL) {
-                    getCourseIds(crsURL);
+    // -----------------------------------------------------------------------------
+    // Promise-based API request scheduler
+    // -----------------------------------------------------------------------------
+
+    function createAbortError() {
+        var error = new Error('The report was canceled.');
+        error.name = 'AbortError';
+        return error;
+    }
+
+    function isAbortError(error) {
+        return error && error.name === 'AbortError';
+    }
+
+    function sleep(milliseconds) {
+        return new Promise(function(resolve, reject) {
+            if (controls.aborted) {
+                reject(createAbortError());
+                return;
+            }
+
+            var timer = window.setTimeout(function() {
+                if (controls.aborted) {
+                    reject(createAbortError());
                 } else {
-                    controls.coursePending = controls.courseArray.length; //Count of courses to be processed
-                    if (controls.coursePending === 0) {
-                        alert('No courses matched your search criteria. Refine your search and try again.');
-                        wrapup();
-                        return false;
-                    }
-                    var pluralCrs = controls.coursePending > 1 ? 's' : '';
-                    var runScriptDlg = 'The records from ' + controls.coursePending + ' course' + pluralCrs + ' will be processed. ';
-                    runScriptDlg += 'The search string you entered is /' + controls.matchString + '/. Continue?';
-                    if (confirm(runScriptDlg) == true) {
-                        progressbar(); // Display progress bar
-                        prepRegex();
-                        makeNewReport(); // Get user accesses for each course selected
-                    } else {
-                        wrapup();
-                    }
+                    resolve();
                 }
-            }).fail(function() {
-                var errorDetail = 'Error getting course IDs';
-                throw new Error(errorDetail);
+            }, milliseconds);
+
+            // Retain the timer so cancellation can stop pending retry delays.
+            requestScheduler.timers.add(timer);
+        }).finally(function() {
+            // Remove completed timers from the scheduler.
+            requestScheduler.timers.forEach(function(timerId) {
+                // Completed timer IDs can safely be removed. Calling clearTimeout
+                // for an already completed timer has no effect.
+                window.clearTimeout(timerId);
+                requestScheduler.timers.delete(timerId);
             });
-        } catch (e) {
-            errorHandler(e);
+        });
+    }
+
+    var requestScheduler = {
+        queue: [],
+        active: 0,
+        limit: controls.initialConcurrency,
+        consecutiveSuccesses: 0,
+        timers: new Set(),
+
+        schedule: function(task) {
+            var scheduler = this;
+
+            return new Promise(function(resolve, reject) {
+                if (controls.aborted) {
+                    reject(createAbortError());
+                    return;
+                }
+
+                scheduler.queue.push({
+                    task: task,
+                    resolve: resolve,
+                    reject: reject
+                });
+
+                scheduler.drain();
+            });
+        },
+
+        drain: function() {
+            var scheduler = this;
+
+            if (controls.aborted) {
+                scheduler.rejectQueued(createAbortError());
+                return;
+            }
+
+            while (
+                scheduler.active < scheduler.limit &&
+                scheduler.queue.length > 0
+            ) {
+                var queuedTask = scheduler.queue.shift();
+                scheduler.active++;
+
+                Promise.resolve()
+                    .then(queuedTask.task)
+                    .then(queuedTask.resolve)
+                    .catch(queuedTask.reject)
+                    .finally(function() {
+                    scheduler.active--;
+                    scheduler.drain();
+                });
+            }
+        },
+
+    reduceConcurrency: function() {
+        this.consecutiveSuccesses = 0;
+
+        if (this.limit > controls.minimumConcurrency) {
+            this.limit--;
+            console.warn(
+                'Canvas request concurrency reduced to ' + this.limit + '.'
+            );
+        }
+    },
+
+    recordSuccess: function() {
+        this.consecutiveSuccesses++;
+
+        if (
+            this.limit < controls.maximumConcurrency &&
+            this.consecutiveSuccesses >= controls.successesBeforeIncrease
+        ) {
+            this.limit++;
+            this.consecutiveSuccesses = 0;
+
+            console.info(
+                'Canvas request concurrency restored to ' + this.limit + '.'
+            );
+
+            this.drain();
+        }
+    },
+
+    rejectQueued: function(error) {
+        while (this.queue.length > 0) {
+            this.queue.shift().reject(error);
+        }
+    },
+
+    cancel: function() {
+        this.rejectQueued(createAbortError());
+
+        this.timers.forEach(function(timerId) {
+            window.clearTimeout(timerId);
+        });
+
+        this.timers.clear();
+    },
+
+    reset: function() {
+        this.queue = [];
+        this.active = 0;
+        this.limit = controls.initialConcurrency;
+        this.consecutiveSuccesses = 0;
+        this.timers.clear();
+    }
+};
+
+
+// -----------------------------------------------------------------------------
+// Request and retry functions
+// -----------------------------------------------------------------------------
+
+function parseRetryAfter(retryAfterValue) {
+    if (!retryAfterValue) {
+        return null;
+    }
+
+    var seconds = Number(retryAfterValue);
+
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.ceil(seconds * 1000);
+    }
+
+    var retryDate = Date.parse(retryAfterValue);
+
+    if (!Number.isNaN(retryDate)) {
+        return Math.max(0, retryDate - Date.now());
+    }
+
+    return null;
+}
+
+function calculateRetryDelay(attempt, jqXHR) {
+    var retryAfter = parseRetryAfter(
+        jqXHR.getResponseHeader('Retry-After')
+    );
+
+    if (retryAfter !== null) {
+        return Math.min(retryAfter, controls.maximumRetryDelay);
+    }
+
+    var exponentialDelay =
+        controls.baseRetryDelay * Math.pow(2, attempt - 1);
+
+    // Random jitter prevents all paused requests from retrying simultaneously.
+    var jitter = Math.floor(Math.random() * 750);
+
+    return Math.min(
+        exponentialDelay + jitter,
+        controls.maximumRetryDelay
+    );
+}
+
+function isCanvasRateLimitError(jqXHR) {
+    if (jqXHR.status === 429) {
+        return true;
+    }
+
+    // Some older or customized Canvas installations may use 403 for a
+    // rate-limit response. Do not retry ordinary authorization failures.
+    if (jqXHR.status === 403) {
+        var responseText = String(jqXHR.responseText || '');
+
+        return /rate.?limit|throttl/i.test(responseText);
+    }
+
+    return false;
+}
+
+function isRetryableStatus(jqXHR, textStatus) {
+    if (textStatus === 'timeout') {
+        return true;
+    }
+
+    if (jqXHR.status === 0 && textStatus !== 'abort') {
+        return true;
+    }
+
+    if (isCanvasRateLimitError(jqXHR)) {
+        return true;
+    }
+
+    return [
+        408,
+        425,
+        500,
+        502,
+        503,
+        504
+    ].includes(jqXHR.status);
+}
+
+function performAjaxRequest(url) {
+    return new Promise(function(resolve, reject) {
+        if (controls.aborted) {
+            reject(createAbortError());
+            return;
+        }
+
+        var jqXHR = $.ajax({
+            url: url,
+            method: 'GET',
+            dataType: 'json',
+            timeout: 45000,
+            cache: false
+        });
+
+        ajaxPool.push(jqXHR);
+
+        jqXHR.done(function(data, textStatus, response) {
+            resolve({
+                data: data,
+                jqXHR: response
+            });
+        });
+
+        jqXHR.fail(function(response, textStatus, errorThrown) {
+            if (textStatus === 'abort' || controls.aborted) {
+                reject(createAbortError());
+                return;
+            }
+
+            var error = new Error(
+                'Canvas request failed. HTTP ' +
+                (response.status || 0) +
+                ' ' +
+                (errorThrown || textStatus) +
+                ': ' +
+                url
+            );
+
+            error.jqXHR = response;
+            error.textStatus = textStatus;
+            error.url = url;
+
+            reject(error);
+        });
+
+        jqXHR.always(function() {
+            var index = ajaxPool.indexOf(jqXHR);
+
+            if (index !== -1) {
+                ajaxPool.splice(index, 1);
+            }
+        });
+    });
+}
+
+async function apiRequest(url, attempt) {
+    attempt = attempt || 1;
+
+    if (controls.aborted) {
+        throw createAbortError();
+    }
+
+    try {
+        var response = await requestScheduler.schedule(function() {
+            return performAjaxRequest(url);
+        });
+
+        requestScheduler.recordSuccess();
+
+        var rateRemaining = Number(
+            response.jqXHR.getResponseHeader('X-Rate-Limit-Remaining')
+        );
+
+        var requestCost = Number(
+            response.jqXHR.getResponseHeader('X-Request-Cost')
+        );
+
+        if (!Number.isNaN(requestCost)) {
+            console.debug(
+                'Canvas request cost:',
+                requestCost,
+                url
+            );
+        }
+
+        if (
+            !Number.isNaN(rateRemaining) &&
+            rateRemaining < controls.lowQuotaThreshold
+        ) {
+            $('#ccf_report_status').text(
+                'Canvas quota is low. Slowing requests...'
+            );
+
+            await sleep(controls.lowQuotaDelay);
+        }
+
+        return response;
+    } catch (error) {
+        if (isAbortError(error) || controls.aborted) {
+            throw createAbortError();
+        }
+
+        var jqXHR = error.jqXHR || {};
+        var textStatus = error.textStatus || '';
+
+        if (
+            isRetryableStatus(jqXHR, textStatus) &&
+            attempt < controls.maximumAttempts
+        ) {
+            if (isCanvasRateLimitError(jqXHR)) {
+                requestScheduler.reduceConcurrency();
+            }
+
+            var delay = calculateRetryDelay(attempt, jqXHR);
+
+            $('#ccf_report_status').text(
+                'Canvas request failed. Retrying attempt ' +
+                (attempt + 1) +
+                ' of ' +
+                controls.maximumAttempts +
+                '...'
+            );
+
+            console.warn(
+                'Retrying Canvas request in ' +
+                delay +
+                ' ms. Attempt ' +
+                (attempt + 1) +
+                ' of ' +
+                controls.maximumAttempts +
+                '.',
+                url,
+                error
+            );
+
+            await sleep(delay);
+
+            return apiRequest(url, attempt + 1);
+        }
+
+        throw error;
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// Pagination
+// -----------------------------------------------------------------------------
+
+async function getAllPages(initialURL) {
+    var allItems = [];
+    var nextPageURL = initialURL;
+
+    while (nextPageURL) {
+        if (controls.aborted) {
+            throw createAbortError();
+        }
+
+        var response = await apiRequest(nextPageURL);
+        var pageItems = Array.isArray(response.data)
+            ? response.data
+            : [];
+
+        allItems.push.apply(allItems, pageItems);
+
+        nextPageURL = nextURL(
+            response.jqXHR.getResponseHeader('Link')
+        );
+    }
+
+    return allItems;
+}
+
+
+// -----------------------------------------------------------------------------
+// Generic concurrent array processing
+// -----------------------------------------------------------------------------
+
+async function mapWithConcurrency(items, concurrency, iterator) {
+    if (!items.length) {
+        return [];
+    }
+
+    var results = new Array(items.length);
+    var nextIndex = 0;
+
+    async function worker() {
+        while (true) {
+            if (controls.aborted) {
+                throw createAbortError();
+            }
+
+            var currentIndex = nextIndex;
+            nextIndex++;
+
+            if (currentIndex >= items.length) {
+                return;
+            }
+
+            results[currentIndex] = await iterator(
+                items[currentIndex],
+                currentIndex
+            );
         }
     }
 
-    // Processes user input from the report options dialog
-    function setupReports(enrllTrm, srchBy, srchTrm) {
-        // console.log('setupReports');
-        var enrollTermID = (enrllTrm > 0) ? "&enrollment_term_id=" + enrllTrm : "";
-        var searchBy = (srchBy == 'true') ? "" : "&search_by=teacher";
-        var searchTrm = (srchTrm.length > 0) ? "&search_term=" + srchTrm : "";
-        document.body.style.cursor = "wait";
-        controls.emptyCourse = false;
-        setupPool();
-        var cURL = '/api/v1/accounts/' + controls.canvasAcct + '/courses?with_enrollments=true' + enrollTermID + searchTrm + searchBy + '&per_page=100';
-        getCourseIds(cURL);
+    var workerCount = Math.min(concurrency, items.length);
+    var workers = [];
+
+    for (var i = 0; i < workerCount; i++) {
+        workers.push(worker());
     }
 
+    await Promise.all(workers);
+
+    return results;
+}
+
+
+// -----------------------------------------------------------------------------
+// Course and resource processing
+// -----------------------------------------------------------------------------
+
+function getSelectedResourceTypes() {
+    var resourceTypes = [];
+
+    if (controls.rsrcTypeAssgnmnts) {
+        resourceTypes.push({
+            label: 'assignments',
+            listPath: 'assignments',
+            idProperty: 'id',
+            contentProperty: 'description',
+            typeIndex: 0
+        });
+    }
+
+    if (controls.rsrcTypeDscssns) {
+        resourceTypes.push({
+            label: 'discussions',
+            listPath: 'discussion_topics',
+            idProperty: 'id',
+            contentProperty: 'message',
+            typeIndex: 1
+        });
+    }
+
+    if (controls.rsrcTypePages) {
+        resourceTypes.push({
+            label: 'pages',
+            listPath: 'pages',
+            idProperty: 'page_id',
+            contentProperty: 'body',
+            typeIndex: 2
+        });
+    }
+
+    if (controls.rsrcTypeQuizzes) {
+        resourceTypes.push({
+            label: 'quizzes',
+            listPath: 'quizzes',
+            idProperty: 'id',
+            contentProperty: 'description',
+            typeIndex: 3
+        });
+    }
+
+    return resourceTypes;
+}
+
+function shouldIncludeResource(resource, resourceType) {
+    if (resourceType.label !== 'discussions') {
+        return true;
+    }
+
+    // Graded discussions are also assignments. Excluding them here prevents
+    // duplicate assignment and discussion results.
+    if (resource.assignment !== undefined && resource.assignment !== null) {
+        return false;
+    }
+
+    // Anonymous discussion contents are not extracted.
+    if (resource.anonymous_state) {
+        return false;
+    }
+
+    return true;
+}
+
+async function parseResource(resourceURL, course, resourceType) {
+    if (controls.aborted) {
+        throw createAbortError();
+    }
+
+    var response = await apiRequest(resourceURL);
+    var resource = response.data;
+    var content = resource[resourceType.contentProperty];
+
+    if (typeof content !== 'string' || content.length === 0) {
+        return null;
+    }
+
+    // match() with a global regex modifies lastIndex behavior in some regex
+    // operations. Reset it before each resource for predictable processing.
+    controls.matchRegex.lastIndex = 0;
+
+    var matches = content.match(controls.matchRegex);
+    var matchCount = matches ? matches.length : 0;
+
+    if (matchCount === 0) {
+        return null;
+    }
+
+    var result = Object.assign({}, resource);
+
+    result.url = resourceURL.replace(
+        /\/api\/v1/,
+        'https://canvas.northwestern.edu'
+    );
+
+    result.course_id = course.id;
+    result.matches = matchCount;
+
+    return result;
+}
+
+async function processResourceType(course, resourceType) {
+    $('#ccf_report_name').text(course.course_code || course.name);
+    $('#ccf_report_status').text('Getting ' + resourceType.label + '...');
+
+    var listURL =
+        '/api/v1/courses/' +
+        course.id +
+        '/' +
+        resourceType.listPath +
+        '?per_page=100';
+
+    var resources = await getAllPages(listURL);
+
+    var eligibleResources = resources.filter(function(resource) {
+        return shouldIncludeResource(resource, resourceType);
+    });
+
+    var completed = 0;
+
+    var matches = await mapWithConcurrency(
+        eligibleResources,
+        controls.maximumConcurrency,
+        async function(resource) {
+            var resourceID = resource[resourceType.idProperty];
+
+            if (
+                resourceID === undefined ||
+                resourceID === null
+            ) {
+                console.warn(
+                    'Canvas resource does not have the expected ID property.',
+                    resourceType.idProperty,
+                    resource
+                );
+
+                return null;
+            }
+
+            var resourceURL =
+                '/api/v1/courses/' +
+                course.id +
+                '/' +
+                resourceType.listPath +
+                '/' +
+                encodeURIComponent(resourceID);
+
+            var result = await parseResource(
+                resourceURL,
+                course,
+                resourceType
+            );
+
+            completed++;
+
+            progressbar(completed, eligibleResources.length);
+
+           $('#ccf_report_status').text('Checking ' + resourceType.label + '...');
+
+            return result;
+        }
+    );
+
+    matches
+        .filter(function(result) {
+            return result !== null;
+        })
+        .forEach(function(result) {
+            pagesData.push(result);
+        });
+}
+
+async function processCourse(courseID, courseNumber, totalCourses) {
+    if (controls.aborted) {
+        throw createAbortError();
+    }
+
+    $('#ccf_report_status').text(
+        'Getting course ' +
+        courseNumber +
+        ' of ' +
+        totalCourses +
+        '...'
+    );
+
+    var response = await apiRequest(
+        '/api/v1/courses/' + encodeURIComponent(courseID)
+    );
+
+    var course = response.data;
+
+    coursesData[course.id] = {
+        id: course.id,
+        course_code: course.course_code || '',
+        name: course.name || '',
+        term: course.enrollment_term_id || ''
+    };
+
+    var resourceTypes = getSelectedResourceTypes();
+
+    // Resource categories within a course are processed sequentially. The
+    // individual resources in each category are processed concurrently.
+    // This avoids submitting every course resource to the queue at once.
+    for (var i = 0; i < resourceTypes.length; i++) {
+        await processResourceType(course, resourceTypes[i]);
+    }
+}
+
+    async function getCourseIds(initialURL) {
+        $('#ccf_report_status').text('Finding matching courses...');
+
+        var courses = await getAllPages(initialURL);
+        var uniqueCourseIDs = new Set();
+
+        courses.forEach(function(course) {
+            var courseCode = String(course.course_code || '');
+            var isDistanceLearning = /-DL_/.test(courseCode);
+            var isCanceled = /_SECX\d\d/.test(courseCode);
+
+            if (isCanceled) {
+                console.info(
+                    (course.name || courseCode) + ' - Canceled'
+                );
+
+                return;
+            }
+
+            if (
+                (controls.dlCrsOnly && isDistanceLearning) ||
+                !controls.dlCrsOnly
+            ) {
+                uniqueCourseIDs.add(course.id);
+            }
+        });
+
+        return Array.from(uniqueCourseIDs);
+    }
+
+    async function runReports(courseURL, runId) {
+        controls.courseArray = await getCourseIds(courseURL);
+        controls.coursePending = controls.courseArray.length;
+
+        if (controls.coursePending === 0) {
+            alert(
+                'No courses matched your search criteria. ' +
+                'Refine your search and try again.'
+            );
+
+            wrapup();
+            return;
+        }
+
+        var plural = controls.coursePending === 1 ? '' : 's';
+
+        var confirmation =
+            'The records from ' +
+            controls.coursePending +
+            ' course' +
+            plural +
+            ' will be processed. ' +
+            'The search string you entered is "' +
+            controls.matchString +
+            '". Continue?';
+
+        if (!window.confirm(confirmation)) {
+            wrapup();
+            return;
+        }
+
+        if (controls.aborted || runId !== currentRunId) {
+            throw createAbortError();
+        }
+
+        prepRegex();
+        progressbar();
+
+        await mapWithConcurrency(
+            controls.courseArray,
+            controls.courseConcurrency,
+            async function(courseID, index) {
+                await processCourse(
+                    courseID,
+                    index + 1,
+                    controls.courseArray.length
+                );
+
+                controls.coursePending--;
+
+                $('#ccf_report_status').text(
+                    'Completed ' +
+                    (index + 1) +
+                    ' of ' +
+                    controls.courseArray.length +
+                    ' courses.'
+                );
+            }
+        );
+
+        if (controls.aborted || runId !== currentRunId) {
+            throw createAbortError();
+        }
+
+        outputReport();
+    }
+
+    async function setupReports(enrllTrm, srchBy, srchTrm) {
+        controls.aborted = false;
+        currentRunId++;
+
+        var runId = currentRunId;
+
+        ajaxPool.length = 0;
+        pagesData.length = 0;
+
+        Object.keys(coursesData).forEach(function(key) {
+            delete coursesData[key];
+        });
+
+        controls.courseArray = [];
+        controls.coursePending = -1;
+
+        requestScheduler.reset();
+
+        var enrollmentTermID =
+            Number(enrllTrm) > 0
+        ? '&enrollment_term_id=' +
+            encodeURIComponent(enrllTrm)
+        : '';
+
+        var searchBy =
+            srchBy === 'true'
+        ? ''
+        : '&search_by=teacher';
+
+        var searchTerm =
+            srchTrm.trim().length > 0
+        ? '&search_term=' +
+            encodeURIComponent(srchTrm.trim())
+        : '';
+
+        var courseURL =
+            '/api/v1/accounts/' +
+            encodeURIComponent(controls.canvasAcct) +
+            '/courses?with_enrollments=true' +
+            enrollmentTermID +
+            searchTerm +
+            searchBy +
+            '&per_page=100';
+
+        document.body.style.cursor = 'wait';
+
+        try {
+            await runReports(courseURL, runId);
+        } catch (error) {
+            if (isAbortError(error)) {
+                console.info('Canvas content search canceled.');
+                return;
+            }
+
+            errorHandler(error);
+        }
+    }
 
     // Report file generating functions below
 
-    function outputReport() {
-        // console.log('outputReport');
-        var reportName = '';
-        var findStrSub = $('#ccf_string_inpt').val().substring(0, 9) + '-';
-        const regex = new RegExp(/[<>:"\/\|?*.]/gi);
-        var findStrSubClean = findStrSub.replace(regex,'!');
-        try {
-            if (controls.aborted) {
-                console.log('Process aborted at makeReport()');
-                controls.aborted = false;
-                return false;
-            }
-            $('#ccf_report_status').text('Compiling report...');
-            var csv = createCSV();
-            if (csv) {
-                var blob = new Blob([ csv ], {
-                    'type' : 'text/csv;charset=utf-8'
-                });
-                reportName = $("#ccf_term_slct option:selected").val() == 0 ? '' : $("#ccf_term_slct option:selected").text() + ' ';
-                reportName += $("#ccf_srch_inpt").val() == 0 ? '' : $("#ccf_srch_inpt").val() + ' ';
-                reportName += 'Find -' + findStrSubClean;
-                reportName +=  ' Report.csv';
-                saveAs(blob, reportName);
-                if (controls.coursePending > 0) {
-                    makeNewReport();
-                } else {
-                    wrapup();
-                }
-            } else {
-                throw new Error('Problem creating report');
-            }
-        } catch (e) {
-            errorHandler(e);
-        }
+  function outputReport() {
+    if (controls.aborted) {
+        return;
     }
 
+    $('#ccf_report_status').text('Compiling report...');
+
+    try {
+        var csv = createCSV();
+
+        var searchFragment = String($('#ccf_string_inpt').val() || '').substring(0, 9);
+
+        var cleanFragment = searchFragment.replace( /[<>:"/\\|?*.\u0000-\u001F]/g,'!');
+
+        var reportName = '';
+
+        if ($('#ccf_term_slct option:selected').val() !== '0') {
+            reportName += $('#ccf_term_slct option:selected').text() + ' ';
+        }
+
+        var courseSearch = String($('#ccf_srch_inpt').val() || '').trim();
+
+        if (courseSearch) {reportName += courseSearch + ' ';
+        }
+
+        var reportLabel = controls.useRegex ? 'Regular Expression' : cleanFragment;
+
+        reportName += 'Find -' + reportLabel + '- Report.csv';
+
+        var blob = new Blob(
+            ['\uFEFF', csv],
+            {
+                type: 'text/csv;charset=utf-8'
+            }
+        );
+
+        saveAs(blob, reportName);
+        wrapup();
+
+    } catch (error) {
+        errorHandler(error);
+    }
+}
+
+function csvCell(value) {
+    if (value === undefined || value === null) {
+        return '';
+    }
+
+    value = String(value);
+
+    // Prevent spreadsheet formula injection.
+    if (/^[=+\-@]/.test(value)) {
+        value = "'" + value;
+    }
+
+    if (/[",\r\n]/.test(value)) {
+        value = '"' + value.replace(/"/g, '""') + '"';
+    }
+
+    return value;
+}
+
     function createCSV() {
-        const assignRegex = RegExp('\/assignments\/');
-        var fields = [ {
-            'name' : 'Course Name',
-            'src' : 'c.name',
-        }, {
-            'name' : 'Course Code',
-            'src' : 'c.course_code',
-        }, {
-            'name' : 'Term ID',
-            'src' : 'c.term',
-        }, {
-            'name' : 'Resource Name',
-            'src' : 'p.title',
-        }, {
-            'name' : 'Matches',
-            'src' : 'p.matches',
-        }, {
-            'name' : 'Resource URL',
-            'src' : 'p.url',
-        }];
-        var canSIS = false;
-        for ( var page_id in pagesData) {
-            if (pagesData.hasOwnProperty(page_id)) {
-                if (typeof pagesData[page_id].sis_user_id !== 'undefined' && pagesData[page_id].sis_user_id) {
-                    canSIS = true;
-                    break;
+        var fields = [
+            {
+                name: 'Course Name',
+                getValue: function(page, course) {
+                    return course.name;
+                }
+            },
+            {
+                name: 'Course Code',
+                getValue: function(page, course) {
+                    return course.course_code;
+                }
+            },
+            {
+                name: 'Term ID',
+                getValue: function(page, course) {
+                    return course.term;
+                }
+            },
+            {
+                name: 'Resource Name',
+                getValue: function(page) {
+                    if (/\/assignments\//.test(page.url)) {
+                        return page.name || page.title || '';
+                    }
+
+                    return page.title || page.name || '';
+                }
+            },
+            {
+                name: 'Matches',
+                getValue: function(page) {
+                    return page.matches;
+                }
+            },
+            {
+                name: 'Resource URL',
+                getValue: function(page) {
+                    return page.url;
                 }
             }
-        }
+        ];
+
         var CRLF = '\r\n';
-        var hdr = [];
-        fields.map(function(e) {
-            if (typeof e.sis === 'undefined' || (e.sis && canSIS)) {
-                var name = (typeof headingNoSpaces !== 'undefined' && headingNoSpaces) ? e.name.replace(' ', '') : e.name;
-                hdr.push(name);
-            }
+
+        var headers = fields.map(function(field) {
+            return headingNoSpaces
+                ? field.name.replace(/\s+/g, '')
+            : field.name;
         });
-        var t = hdr.join(',') + CRLF;
-        var page, course, courseId, fieldInfo, value;
-        for (var i = 0; i < pagesData.length; i++) {
-            page = pagesData[i];
-            courseId = page.course_id;
-            course = coursesData[courseId];
-            console.log(page);
-            console.log(course);
-            for (var j = 0; j < fields.length; j++) {
-                if (typeof fields[j].sis !== 'undefined' && fields[j].sis && !canSIS) {
-                    continue;
-                }
-                fieldInfo = fields[j].src.split('.');
-                console.log(fieldInfo);
-                value = fieldInfo[0] == 'p' ? page[fieldInfo[1]] : course[fieldInfo[1]];
-                if (fieldInfo[1] == 'title') {
-                    if (assignRegex.test(page.url)) {
-                        value = page.name;
-                    }
-                }
-                if (typeof value === 'undefined' || value === null) {
-                    value = '';
-                } else {
-                    if (typeof value === 'string') {
-                        var quote = false;
-                        if (value.indexOf('"') > -1) {
-                            value = value.replace(/"/g, '""');
-                            quote = true;
-                        }
-                        if (value.indexOf(',') > -1) {
-                            quote = true;
-                        }
-                        if (quote) {
-                            value = '"' + value + '"';
-                        }
-                    }
-                }
-                if (j > 0) {
-                    t += ',';
-                }
-                t += value;
-            }
-            t += CRLF;
-        }
-        return t;
+
+        var rows = [headers.map(csvCell).join(',')];
+
+        pagesData.forEach(function(page) {
+            var course = coursesData[page.course_id] || {};
+
+            var row = fields.map(function(field) {
+                return csvCell(field.getValue(page, course));
+            });
+
+            rows.push(row.join(','));
+        });
+
+        return rows.join(CRLF) + CRLF;
     }
 
     // User interface functions below
 
-    // Clear or reset objects, arrays and vars of all data, reset UI
-    function wrapup() {
-        // console.log('wrapup');
-        if ($('#ccf_progress_dialog').dialog('isOpen')) {
+    function wrapup(wasCanceled) {
+        if ($('#ccf_progress_dialog').length && $('#ccf_progress_dialog').dialog('isOpen')) {
             $('#ccf_progress_dialog').dialog('close');
         }
-        Object.keys(currCourse).forEach(function(key) { delete currCourse[key]; });
-        Object.keys(coursesData).forEach(function(key) { delete coursesData[key]; });
-        controls.aborted = false;
+
+        requestScheduler.cancel();
+
+        ajaxPool.length = 0;
         controls.courseArray = [];
         controls.courseIndex = 0;
         controls.coursePending = -1;
         controls.pagesArray = [];
-        document.body.style.cursor = "default"; // Restore default cursor
-        $('#ccf_pages_report').one('click', reportOptionsDlg); // Re-enable Find Content button
+
+        document.body.style.cursor = 'default';
+
+        $('#ccf_pages_report')
+            .off('click.ccf')
+            .one('click.ccf', reportOptionsDlg);
+
+        if (wasCanceled) {
+            // Reset on a later event-loop turn so already-rejected promises still
+            // observe the canceled state.
+            window.setTimeout(function() {
+                controls.aborted = false;
+            }, 0);
+        } else {
+            controls.aborted = false;
+        }
     }
 
     function progressbar(current, total) {
@@ -481,7 +1148,26 @@
                 if ($('#ccf_progress_dialog').length === 0) {
                     $('body').append('<div id="ccf_progress_dialog"></div>');
                     $('#ccf_progress_dialog').append('<div id="ccf_report_name" style="font-size: 12pt; font-weight:bold"></div>');
-                    $('#ccf_progress_dialog').append('<div id="ccf_progressbar"></div>');
+                    $('#ccf_progress_dialog').append(
+                        '<div id="ccf_progressbar_wrapper" style="position:relative;">' +
+                        '<div id="ccf_progressbar"></div>' +
+                        '<div id="ccf_progressbar_label" ' +
+                        'style="' +
+                        'position:absolute;' +
+                        'top:0;' +
+                        'left:0;' +
+                        'width:100%;' +
+                        'height:100%;' +
+                        'display:flex;' +
+                        'align-items:center;' +
+                        'justify-content:center;' +
+                        'font-weight:bold;' +
+                        'z-index:1000;' +
+                        'pointer-events:none;' +
+                        '">' +
+                        '</div>' +
+                        '</div>'
+                    );
                     $('#ccf_progress_dialog').append('<div id="ccf_report_status" style="font-size: 12pt; text-align: center"></div>');
                     $('#ccf_progress_dialog').dialog({
                         'title' : 'Fetching Canvas Data',
@@ -492,25 +1178,37 @@
                                 $(this).dialog('close');
                                 controls.aborted = true;
                                 abortAll();
-                                wrapup();
                             }
                         }]
                     });
-                    $('.ui-dialog-titlebar-close').remove(); // Remove titlebar close button forcing users to form buttons
+                    $('.ui-dialog-titlebar-close').remove(); // Remove titlebar close button forcing users to use form button
                 }
                 if ($('#ccf_progress_dialog').dialog('isOpen')) {
                     $('#ccf_progress_dialog').dialog('close');
                 } else {
                     $('#ccf_progressbar').progressbar({
-                        'value' : false
+                        value: false
                     });
+
+                    $('#ccf_progressbar_label').text('');
+
                     $('#ccf_progress_dialog').dialog('open');
                 }
             } else {
                 if (!controls.aborted) {
-                    // console.log(current + '/' + total);
-                    var val = current > 0 ? Math.round(100 * current / total) : false;
-                    $('#ccf_progressbar').progressbar('option', 'value', val);
+                    var val = total > 0
+                    ? Math.round((current / total) * 100)
+                    : false;
+
+                    $('#ccf_progressbar').progressbar(
+                        'option',
+                        'value',
+                        val
+                    );
+
+                    $('#ccf_progressbar_label').text(
+                        current + ' / ' + total
+                    );
                 }
             }
         } catch (e) {
@@ -519,7 +1217,9 @@
     }
 
     function enableReportOptionsDlgOK() {
-        if (($("#ccf_term_slct").val() != 0 || $("#ccf_srch_inpt").val() != '') && $.trim($("#ccf_string_inpt").val()) != '') {
+        var resourceSelected = $('#ccf_assngmnts_chbx').prop('checked') || $('#ccf_dscssns_chbx').prop('checked') || $('#ccf_pages_chbx').prop('checked') || $('#ccf_quizzes_chbx').prop('checked');
+        console.log(resourceSelected);
+        if (($("#ccf_term_slct").val() != 0 || $("#ccf_srch_inpt").val() != '') && $.trim($("#ccf_string_inpt").val()) != '' && resourceSelected) {
             $('#ccf_term_slct').closest(".ui-dialog").find("button:contains('OK')").removeAttr('disabled').removeClass( 'ui-state-disabled' );;
         } else {
              $('#ccf_term_slct').closest(".ui-dialog").find("button:contains('OK')").prop("disabled", true).addClass("ui-state-disabled");
@@ -531,10 +1231,31 @@
             if ($('#ccf_options_frm').length === 0) {
                 // Update this array with new Canvas term IDs and labels as quarters/terms are added
                 // Populates the term select menu in the "Select Report Options" dialog box
-                var terms = {data:[
+     var terms = {data:[
                     {val : 0, txt: 'Select a term'},
-                    {val : 168, txt: '2020 Fall'},
-                    {val : 167, txt: '2020-2021 Academic Year'},
+         { val: 399, txt: '2027 Winter' },
+         { val: 398, txt: '2026 Fall' },
+         { val: 401, txt: '2026-2027 Academic Year' },
+         { val: 397, txt: '2026 Summer' },
+         { val: 396, txt: '2026 Spring' },
+                    {val : 393, txt: '2026 Winter'},
+                    {val : 392, txt: '2025 Fall'},
+                    {val : 395, txt: '2025-2026 Academic Year'},
+                    {val : 394, txt: '2025 Summer'},
+                    {val : 391, txt: '2025 Spring'},
+                    {val : 390, txt: '2025 Winter'},
+                    {val : 389, txt: '2024 Fall'},
+                    {val : 388, txt: '2024-2025 Academic Year'},
+                    {val : 287, txt: '2024 Summer'},
+                    {val : 286, txt: '2024 Spring'},
+                    {val : 285, txt: '2024 Winter'},
+                    {val : 284, txt: '2023 Fall'},
+                    {val : 283, txt: '2023-2024 Academic Year'},
+                    {val : 281, txt: '2023 Summer'},
+                    {val : 282, txt: '2023 Spring'},
+                    {val : 278, txt: '2023 Winter'},
+                    {val : 280, txt: '2022 Fall'},
+                    {val : 279, txt: '2022-2023 Academic Year'},
                     {val : 166, txt: '2020 Summer'},
                     {val : 165, txt: '2020 Spring'},
                     {val : 164, txt: '2020 Winter'},
@@ -583,9 +1304,9 @@
                 ]};
                 // Define "Select Report Options" dialog box
                 $('body').append('<div id="ccf_options_dialog"></div>');
-                $('#ccf_options_dialog').append('<form id="ccf_options_frm"></div>');
+                $('#ccf_options_dialog').append('<form id="ccf_options_frm"></form>');
                 $('#ccf_options_frm').append('<fieldset id="ccf_options_fldst"></fieldset>');
-                $('#ccf_options_fldst').append('<select id="ccf_term_slct">');
+                $('#ccf_options_fldst').append('<select id="ccf_term_slct"></select>');
                 $('#ccf_options_fldst').append('<br/>');
                 $('#ccf_options_fldst').append('<input type="radio" name="ccf_srch_rdo" id="coursename" value="true" checked="checked">');
                 $('#ccf_options_fldst').append('<label for="coursename">&nbsp;Course Name</label>');
@@ -595,24 +1316,33 @@
                 $('#ccf_options_fldst').append('<br/>');
                 $('#ccf_options_fldst').append('<label for="ccf_srch_inpt">Course/instructor search text:</label>');
                 $('#ccf_options_fldst').append('<input type="text" id="ccf_srch_inpt" name="ccf_srch_inpt">');
-                $('#ccf_options_fldst').append('<hr/>');
                 $('#ccf_options_fldst').append('<label for="ccf_string_inpt">Find text/code string:</label>');
-                $('#ccf_options_fldst').append('<textarea columns="50" id="ccf_string_inpt" name="ccf_string_inpt" rows="4">');
+                $('#ccf_options_fldst').append('<textarea cols="50" id="ccf_string_inpt" name="ccf_string_inpt" rows="2"></textarea>');
                 $('#ccf_options_fldst').append('<br/>');
                 $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_case_chbx" name="ccf_case_chbx" value="true">');
                 $('#ccf_options_fldst').append('<label for="ccf_case_chbx">&nbsp; Case insensitive</label>');
                 $('#ccf_options_fldst').append('<br/>');
-                $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_multi_line_chbx" name="ccf_multi_line_chbx" value="true">');
-                $('#ccf_options_fldst').append('<label for="ccf_multi_line_chbx">&nbsp; Multi-line</label>');
-                $("#ccf_term_slct").change(function() {
+                $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_regex_chbx" name="ccf_regex_chbx" value="true">');
+                $('#ccf_regex_chbx').attr('title', 'Regular expressions are interpreted as JavaScript RegEx patterns. Leave unchecked for an exact text search.');
+                $('#ccf_options_fldst').append('<label for="ccf_regex_chbx">&nbsp; Regular Expression search</label>');
+                $('#ccf_options_fldst').append('<p>Select course resources to search:</p>');
+                $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_assngmnts_chbx" name="ccf_assngmnts_chbx" value="true" checked="checked">');
+                $('#ccf_options_fldst').append('<label for="ccf_assngmnts_chbx">&nbsp; Assignments</label>');
+                $('#ccf_options_fldst').append('<br/>');
+                $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_dscssns_chbx" name="ccf_dscssns_chbx" value="true" checked="checked">');
+                $('#ccf_options_fldst').append('<label for="ccf_dscssns_chbx">&nbsp; Discussions</label>');
+                $('#ccf_options_fldst').append('<br/>');
+                $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_pages_chbx" name="ccf_pages_chbx" value="true" checked="checked">');
+                $('#ccf_options_fldst').append('<label for="ccf_pages_chbx">&nbsp; Pages</label>');
+                $('#ccf_options_fldst').append('<br/>');
+                $('#ccf_options_fldst').append('<input type="checkbox" id="ccf_quizzes_chbx" name="ccf_quizzes_chbx" value="true" checked="checked">');
+                $('#ccf_options_fldst').append('<label for="ccf_quizzes_chbx">&nbsp; Quizzes</label>');
+
+                $("#ccf_options_frm").change(function() {
                     enableReportOptionsDlgOK();
                 });
-                $("#ccf_srch_inpt").change(function() {
-                    enableReportOptionsDlgOK();
-                });
-                $("#ccf_string_inpt").change(function() {
-                    enableReportOptionsDlgOK();
-                });
+
+
                 $('#ccf_options_dialog').dialog ({
                     'title' : 'Select Report Options',
                     'modal' : true,
@@ -625,8 +1355,12 @@
                             var srchTermsStr = $("#ccf_srch_inpt").val();
                             controls.matchString = $("#ccf_string_inpt").val();
                             controls.matchNoCase = $("#ccf_case_chbx").prop('checked');
-                            controls.multiLine = $("#ccf_multi_line_chbx").prop('checked');
-                            setupReports(enrllTrmSelct, srchByChecked, srchTermsStr);
+                            controls.useRegex = $("#ccf_regex_chbx").prop("checked");
+                            controls.rsrcTypeAssgnmnts = $("#ccf_assngmnts_chbx").prop('checked');
+                            controls.rsrcTypeDscssns = $("#ccf_dscssns_chbx").prop('checked');
+                            controls.rsrcTypePages = $("#ccf_pages_chbx").prop('checked');
+                            controls.rsrcTypeQuizzes = $("#ccf_quizzes_chbx").prop('checked');
+                            void setupReports(enrllTrmSelct,srchByChecked,srchTermsStr);
                         },
                         "Cancel": function () {
                             $(this).dialog('close');
@@ -644,15 +1378,6 @@
                         }));
                     });
                 }
-                if ($('#ccf_report_slct').children('option').length === 0) { // add report types to reports select element
-                    $.each(reports.data, function (key, value) {
-                        $("#ccf_report_slct").append($('<option>', {
-                            value: value.val,
-                            text: value.txt,
-                            'data-mark': value.id
-                        }));
-                    });
-                }
             }
             //$('#ccf_options_dialog').css('z-index', '9000');
             $('#ccf_options_dialog').dialog('open');
@@ -661,17 +1386,17 @@
         }
     }
 
-    // Add "Content Finder" link below navigation
-    function addReportsLink() {
+    // Add "Find Canvas Content" link below navigation
+    function addFinderLink() {
         if ($('#ccf_pages_report').length === 0) {
-            $('#left-side').append('<div class="rs-margin-bottom"><a id="ccf_pages_report"><span aria-hidden="true" style="color:#f92626; cursor: pointer; display: block; font-size: 1rem; line-height: 20px; margin: 5px auto; padding: 8px 0px 8px 6px;">Content Finder</span><span class="screenreader-only">Content Finder</span></a></div>');
+            $('#section-tabs').append('<li class="section"><a id="ccf_pages_report" style="color:#f92626; cursor:pointer">Content Finder<span class="screenreader-only">Content Finder</span></a></li>');
             $('#ccf_pages_report').one('click', reportOptionsDlg);
         }
         return;
     }
 
     $(document).ready(function() {
-        addReportsLink(); // Add reports link to page
+        addFinderLink(); // Add reports link to page
     });
     $.noConflict(true);
 }());
