@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Find Canvas Content
-// @namespace    https://github.com/djm60546/pages-text-content-locater
+// @namespace    https://github.com/djm60546/canvas_content_finder/
 // @version      2.01
 // @description  Script for finding code or text in multiple Canvas courses using the Canvas API. Generates a .CSV download containing the find results.
 // @author       Dan Murphy, Northwestern University School of Professional Studies (dmurphy@northwestern.edu)
