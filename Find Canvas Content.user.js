@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Find Canvas Content
 // @namespace    https://github.com/djm60546/pages-text-content-locater
-// @version      2.0
-// @description  Script for finding code or text strings in multiple Canvas courses using the Canvas API. Generates a .CSV download containing the find results.
+// @version      2.01
+// @description  Script for finding code or text in multiple Canvas courses using the Canvas API. Generates a .CSV download containing the find results.
 // @author       Dan Murphy, Northwestern University School of Professional Studies (dmurphy@northwestern.edu)
 // @match        https://canvas.northwestern.edu/accounts/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
@@ -45,12 +45,13 @@
     controls.contentLabelArray = ['assignments','discussions','pages','quizzes']
 
     // Concurrency and retry configuration
-    controls.initialConcurrency = 4;
+    controls.initialConcurrency = 2;
     controls.minimumConcurrency = 1;
     controls.maximumConcurrency = 4;
-    controls.courseConcurrency = 2;
+    controls.courseConcurrency = 1;
 
     controls.maximumAttempts = 6;
+    controls.maximum403Attempts = 3;
     controls.baseRetryDelay = 1000;
     controls.maximumRetryDelay = 30000;
 
@@ -63,7 +64,7 @@
 
     function errorHandler(error) {
         if (isAbortError(error)) {
-            console.info('Canvas content search canceled.');
+            console.warn('Canvas content search canceled.');
             return;
         }
 
@@ -111,20 +112,22 @@
     function nextURL(linkHeader) {
         if (!linkHeader) {
             return null;
-            }
-
-            var links = linkHeader.split(',');
-
-            for (var i = 0; i < links.length; i++) {
-                var match = links[i].match(/<([^>]+)>\s\srel="next"/);
-
-                if (match) {
-                    return match[1];
-                }
-            }
-
-            return null;
         }
+
+        var links = linkHeader.split(',');
+
+        for (var i = 0; i < links.length; i++) {
+            var match = links[i].match(
+                /<([^>]+)>\s*;\s*rel\s*=\s*["']next["']/i
+            );
+
+            if (match) {
+                return match[1];
+            }
+        }
+
+        return null;
+    }
 
     // Create RegEx string for the search term, escape reserved characters, set RegEx flags based on user input
     function prepRegex() {
@@ -145,7 +148,7 @@
             } else {
 
                 // Literal text search
-                var escaped = String(controls.matchString).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+                var escaped = String(controls.matchString).replace(/[.*+?^${}()|[\]\\]\//g,'\\$&');
 
                 controls.matchRegex = new RegExp(escaped,flags);
             }
@@ -336,14 +339,24 @@ function calculateRetryDelay(attempt, jqXHR) {
     );
 
     if (retryAfter !== null) {
-        return Math.min(retryAfter, controls.maximumRetryDelay);
+        return Math.min(
+            retryAfter,
+            controls.maximumRetryDelay
+        );
+    }
+
+    var baseDelay = controls.baseRetryDelay;
+
+    // Give Canvas more breathing room after a 403.
+    if (jqXHR.status === 403) {
+        baseDelay = 3000;
     }
 
     var exponentialDelay =
-        controls.baseRetryDelay * Math.pow(2, attempt - 1);
+        baseDelay * Math.pow(2, attempt - 1);
 
-    // Random jitter prevents all paused requests from retrying simultaneously.
-    var jitter = Math.floor(Math.random() * 750);
+    // Random jitter prevents concurrent requests from retrying together.
+    var jitter = Math.floor(Math.random() * 1000);
 
     return Math.min(
         exponentialDelay + jitter,
@@ -356,18 +369,34 @@ function isCanvasRateLimitError(jqXHR) {
         return true;
     }
 
-    // Some older or customized Canvas installations may use 403 for a
-    // rate-limit response. Do not retry ordinary authorization failures.
-    if (jqXHR.status === 403) {
-        var responseText = String(jqXHR.responseText || '');
-
-        return /rate.?limit|throttl/i.test(responseText);
+    if (jqXHR.status !== 403) {
+        return false;
     }
 
-    return false;
+    var responseText = String(jqXHR.responseText || '');
+
+    // Look for an explicit indication from Canvas that this is throttling.
+    if (
+        /rate.?limit|throttl|too many requests|request quota/i.test(
+            responseText
+        )
+    ) {
+        return true;
+    }
+
+    // A depleted Canvas API quota is also a strong indication that the
+    // 403 is temporary rather than a permissions failure.
+    var rateRemaining = Number(
+        jqXHR.getResponseHeader('X-Rate-Limit-Remaining')
+    );
+
+    return (
+        Number.isFinite(rateRemaining) &&
+        rateRemaining <= 0
+    );
 }
 
-function isRetryableStatus(jqXHR, textStatus) {
+function isRetryableStatus(jqXHR, textStatus, attempt) {
     if (textStatus === 'timeout') {
         return true;
     }
@@ -377,6 +406,15 @@ function isRetryableStatus(jqXHR, textStatus) {
     }
 
     if (isCanvasRateLimitError(jqXHR)) {
+        return true;
+    }
+
+    // Canvas sometimes returns a transient 403 even when the response
+    // doesn't clearly identify it as throttling. Retry these cautiously.
+    if (
+        jqXHR.status === 403 &&
+        attempt < controls.maximum403Attempts
+    ) {
         return true;
     }
 
@@ -497,12 +535,15 @@ async function apiRequest(url, attempt) {
         var textStatus = error.textStatus || '';
 
         if (
-            isRetryableStatus(jqXHR, textStatus) &&
+            isRetryableStatus(jqXHR, textStatus, attempt) &&
             attempt < controls.maximumAttempts
         ) {
-            if (isCanvasRateLimitError(jqXHR)) {
-                requestScheduler.reduceConcurrency();
-            }
+        if (
+            isCanvasRateLimitError(jqXHR) ||
+            jqXHR.status === 403
+        ) {
+            requestScheduler.reduceConcurrency();
+        }
 
             var delay = calculateRetryDelay(attempt, jqXHR);
 
@@ -1144,81 +1185,56 @@ function csvCell(value) {
 
     function progressbar(current, total) {
         try {
-            if (typeof total === 'undefined' || typeof current == 'undefined') {
-                if ($('#ccf_progress_dialog').length === 0) {
-                    $('body').append('<div id="ccf_progress_dialog"></div>');
-                    $('#ccf_progress_dialog').append('<div id="ccf_report_name" style="font-size: 12pt; font-weight:bold"></div>');
-                    $('#ccf_progress_dialog').append(
-                        '<div id="ccf_progressbar_wrapper" style="position:relative;">' +
-                        '<div id="ccf_progressbar"></div>' +
-                        '<div id="ccf_progressbar_label" ' +
-                        'style="' +
-                        'position:absolute;' +
-                        'top:0;' +
-                        'left:0;' +
-                        'width:100%;' +
-                        'height:100%;' +
-                        'display:flex;' +
-                        'align-items:center;' +
-                        'justify-content:center;' +
-                        'font-weight:bold;' +
-                        'z-index:1000;' +
-                        'pointer-events:none;' +
-                        '">' +
-                        '</div>' +
-                        '</div>'
-                    );
-                    $('#ccf_progress_dialog').append('<div id="ccf_report_status" style="font-size: 12pt; text-align: center"></div>');
-                    $('#ccf_progress_dialog').dialog({
-                        'title' : 'Fetching Canvas Data',
-                        'autoOpen' : false,
-                        'buttons' : [ {
-                            'text' : 'Cancel',
-                            'click' : function() {
-                                $(this).dialog('close');
-                                controls.aborted = true;
-                                abortAll();
-                            }
-                        }]
-                    });
-                    $('.ui-dialog-titlebar-close').remove(); // Remove titlebar close button forcing users to use form button
-                }
+            if ($('#ccf_progress_dialog').length === 0) {initProgressDialog()}
+            if (typeof total === 'undefined' || typeof current == 'undefined' || controls.aborted) {
                 if ($('#ccf_progress_dialog').dialog('isOpen')) {
                     $('#ccf_progress_dialog').dialog('close');
                 } else {
-                    $('#ccf_progressbar').progressbar({
-                        value: false
-                    });
-
+                    $('#ccf_progressbar').progressbar({value: false});
                     $('#ccf_progressbar_label').text('');
-
                     $('#ccf_progress_dialog').dialog('open');
                 }
             } else {
-                if (!controls.aborted) {
-                    var val = total > 0
-                    ? Math.round((current / total) * 100)
-                    : false;
-
-                    $('#ccf_progressbar').progressbar(
-                        'option',
-                        'value',
-                        val
-                    );
-
-                    $('#ccf_progressbar_label').text(
-                        current + ' / ' + total
-                    );
-                }
+                    var val = total > 0? Math.round((current / total) * 100) : false;
+                    $('#ccf_progressbar').progressbar('option','value',val);
+                    $('#ccf_progressbar_label').text(current + ' / ' + total);
             }
         } catch (e) {
             errorHandler(e);
         }
     }
 
+    function initProgressDialog() {
+        try {
+            $('body').append('<div id="ccf_progress_dialog"></div>');
+            $('#ccf_progress_dialog').append('<div id="ccf_report_name" style="font-size: 12pt; font-weight:bold"></div>');
+            $('#ccf_progress_dialog').append('<div id="ccf_progressbar_wrapper" style="position:relative;"></div>');
+            $('#ccf_progressbar_wrapper').append('<div id="ccf_progressbar"></div>');
+            $("#ccf_progressbar").progressbar({value: 0});
+            $('#ccf_progressbar').children().first().css({'background-color' : '#cef', 'height': '20px'});
+            $('#ccf_progressbar_wrapper').append('<div id="ccf_progressbar_label" style="position: absolute; z-index: 1000; top: 0; margin-top: 0.24rem; width:100%; height:1.5rem; text-align:center; font-weight:bold"></div>');
+            $('#ccf_progress_dialog').append('<div id="ccf_report_status" style="font-size: 12pt; text-align: center"></div>');
+            $('#ccf_progress_dialog').dialog({
+                'title' : 'Fetching Canvas Data',
+                'autoOpen' : false,
+                'buttons' : [ {
+                    'text' : 'Cancel',
+                    'click' : function() {
+                        $(this).dialog('close');
+                        controls.aborted = true;
+                        abortAll();
+                    }
+                }]
+            });
+            $('.ui-dialog-titlebar-close').remove(); // Remove titlebar close button forcing users to use form button
+        } catch (e) {
+            errorHandler(e);
+        }
+    }
+
+
     function enableReportOptionsDlgOK() {
         var resourceSelected = $('#ccf_assngmnts_chbx').prop('checked') || $('#ccf_dscssns_chbx').prop('checked') || $('#ccf_pages_chbx').prop('checked') || $('#ccf_quizzes_chbx').prop('checked');
-        console.log(resourceSelected);
         if (($("#ccf_term_slct").val() != 0 || $("#ccf_srch_inpt").val() != '') && $.trim($("#ccf_string_inpt").val()) != '' && resourceSelected) {
             $('#ccf_term_slct').closest(".ui-dialog").find("button:contains('OK')").removeAttr('disabled').removeClass( 'ui-state-disabled' );;
         } else {
@@ -1232,68 +1248,71 @@ function csvCell(value) {
                 // Update this array with new Canvas term IDs and labels as quarters/terms are added
                 // Populates the term select menu in the "Select Report Options" dialog box
      var terms = {data:[
-                    {val : 0, txt: 'Select a term'},
-         { val: 399, txt: '2027 Winter' },
-         { val: 398, txt: '2026 Fall' },
-         { val: 401, txt: '2026-2027 Academic Year' },
-         { val: 397, txt: '2026 Summer' },
-         { val: 396, txt: '2026 Spring' },
-                    {val : 393, txt: '2026 Winter'},
-                    {val : 392, txt: '2025 Fall'},
-                    {val : 395, txt: '2025-2026 Academic Year'},
-                    {val : 394, txt: '2025 Summer'},
-                    {val : 391, txt: '2025 Spring'},
-                    {val : 390, txt: '2025 Winter'},
-                    {val : 389, txt: '2024 Fall'},
-                    {val : 388, txt: '2024-2025 Academic Year'},
-                    {val : 287, txt: '2024 Summer'},
-                    {val : 286, txt: '2024 Spring'},
-                    {val : 285, txt: '2024 Winter'},
-                    {val : 284, txt: '2023 Fall'},
-                    {val : 283, txt: '2023-2024 Academic Year'},
-                    {val : 281, txt: '2023 Summer'},
-                    {val : 282, txt: '2023 Spring'},
-                    {val : 278, txt: '2023 Winter'},
-                    {val : 280, txt: '2022 Fall'},
-                    {val : 279, txt: '2022-2023 Academic Year'},
-                    {val : 166, txt: '2020 Summer'},
-                    {val : 165, txt: '2020 Spring'},
-                    {val : 164, txt: '2020 Winter'},
-                    {val : 163, txt: '2019 Fall'},
-                    {val : 129, txt: '2019-2020 Academic Year'},
-                    {val : 131, txt: '2019-2020 Academic Year'},
-                    {val : 128, txt: '2019 Summer'},
-                    {val : 127, txt: '2019 Spring'},
-                    {val : 124, txt: '2019 Winter'},
-                    {val : 126, txt: '2018 Fall'},
-                    {val : 125, txt: '2018-2019 Med Academic Year'},
-                    {val : 130, txt: '2018-2019 Academic Year'},
-                    {val : 123, txt: '2018 Summer'},
-                    {val : 122, txt: '2018 Spring'},
-                    {val : 121, txt: '2018 Winter'},
-                    {val : 120, txt: '2017 Fall'},
-                    {val : 118, txt: '2017-2018 Academic Year'},
-                    {val : 119, txt: '2017 Summer'},
-                    {val : 113, txt: '2017 Spring'},
-                    {val : 112, txt: '2017 Winter'},
-                    {val : 111, txt: '2016 Fall'},
-                    {val : 109, txt: '2016-2017 Academic Year'},
-                    {val : 110, txt: '2016 Summer'},
-                    {val : 107, txt: '2016 Spring'},
-                    {val : 106, txt: '2016 Winter'},
-                    {val : 105, txt: '2015 Fall'},
-                    {val : 108, txt: '2015-2016 Academic Year'},
-                    {val : 103, txt: '2015 Summer'},
-                    {val : 93, txt: '2015 Spring'},
-                    {val : 96, txt: '2015 Winter'},
-                    {val : 92, txt: '2014 Fall'},
-                    {val : 104, txt: '2014-2015 Academic Year'},
-                    {val : 115, txt: 'Advising Term'},
-                    {val : 1, txt: 'Default Term'},
-                    {val : 116, txt: 'Demo Term'},
-                    {val : 114, txt: 'Prep Site Term'},
-                    {val : 117, txt: 'Program Term'}
-                ]};
+         {val : 0, txt: 'Select a term'},
+         {val: 403, txt: '2027 Fall' },
+         {val: 402, txt: '2027 Summer' },
+         {val: 400, txt: '2027 Spring' },
+         {val: 399, txt: '2027 Winter' },
+         {val: 398, txt: '2026 Fall' },
+         {val: 401, txt: '2026-2027 Academic Year' },
+         {val: 397, txt: '2026 Summer' },
+         {val: 396, txt: '2026 Spring' },
+         {val : 393, txt: '2026 Winter'},
+         {val : 392, txt: '2025 Fall'},
+         {val : 395, txt: '2025-2026 Academic Year'},
+         {val : 394, txt: '2025 Summer'},
+         {val : 391, txt: '2025 Spring'},
+         {val : 390, txt: '2025 Winter'},
+         {val : 389, txt: '2024 Fall'},
+         {val : 388, txt: '2024-2025 Academic Year'},
+         {val : 287, txt: '2024 Summer'},
+         {val : 286, txt: '2024 Spring'},
+         {val : 285, txt: '2024 Winter'},
+         {val : 284, txt: '2023 Fall'},
+         {val : 283, txt: '2023-2024 Academic Year'},
+         {val : 281, txt: '2023 Summer'},
+         {val : 282, txt: '2023 Spring'},
+         {val : 278, txt: '2023 Winter'},
+         {val : 280, txt: '2022 Fall'},
+         {val : 279, txt: '2022-2023 Academic Year'},
+         {val : 166, txt: '2020 Summer'},
+         {val : 165, txt: '2020 Spring'},
+         {val : 164, txt: '2020 Winter'},
+         {val : 163, txt: '2019 Fall'},
+         {val : 129, txt: '2019-2020 Academic Year'},
+         {val : 131, txt: '2019-2020 Academic Year'},
+         {val : 128, txt: '2019 Summer'},
+         {val : 127, txt: '2019 Spring'},
+         {val : 124, txt: '2019 Winter'},
+         {val : 126, txt: '2018 Fall'},
+         {val : 125, txt: '2018-2019 Med Academic Year'},
+         {val : 130, txt: '2018-2019 Academic Year'},
+         {val : 123, txt: '2018 Summer'},
+         {val : 122, txt: '2018 Spring'},
+         {val : 121, txt: '2018 Winter'},
+         {val : 120, txt: '2017 Fall'},
+         {val : 118, txt: '2017-2018 Academic Year'},
+         {val : 119, txt: '2017 Summer'},
+         {val : 113, txt: '2017 Spring'},
+         {val : 112, txt: '2017 Winter'},
+         {val : 111, txt: '2016 Fall'},
+         {val : 109, txt: '2016-2017 Academic Year'},
+         {val : 110, txt: '2016 Summer'},
+         {val : 107, txt: '2016 Spring'},
+         {val : 106, txt: '2016 Winter'},
+         {val : 105, txt: '2015 Fall'},
+         {val : 108, txt: '2015-2016 Academic Year'},
+         {val : 103, txt: '2015 Summer'},
+         {val : 93, txt: '2015 Spring'},
+         {val : 96, txt: '2015 Winter'},
+         {val : 92, txt: '2014 Fall'},
+         {val : 104, txt: '2014-2015 Academic Year'},
+         {val : 115, txt: 'Advising Term'},
+         {val : 1, txt: 'Default Term'},
+         {val : 116, txt: 'Demo Term'},
+         {val : 114, txt: 'Prep Site Term'},
+         {val : 117, txt: 'Program Term'}
+     ]};
                 // Populates the reports select menu in the "Select Report Options" dialog box
                 var reports = {data:[
                     {val : '0', txt: 'Select a report type'},
